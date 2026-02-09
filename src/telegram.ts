@@ -274,6 +274,9 @@ export async function connectTelegram(botToken: string): Promise<void> {
     logger.error({ err: err.message }, "Telegram bot error");
   });
 
+  // Clear any previously registered bot commands
+  await bot.api.deleteMyCommands();
+
   // Start polling
   bot.start({
     onStart: (botInfo) => {
