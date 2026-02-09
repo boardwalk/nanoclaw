@@ -1,7 +1,13 @@
+import fs from "fs";
+import os from "os";
+import path from "path";
+
 import { Bot } from "grammy";
 import {
   ASSISTANT_NAME,
+  TELEGRAM_BOT_TOKEN,
   TRIGGER_PATTERN,
+  VOICE_TRIGGER_PATTERN,
 } from "./config.js";
 import {
   getAllRegisteredGroups,
@@ -9,6 +15,7 @@ import {
   storeMessageDirect,
 } from "./db.js";
 import { logger } from "./logger.js";
+import { isWhisperReady, transcribe } from "./whisper.js";
 
 let bot: Bot | null = null;
 
@@ -134,7 +141,122 @@ export async function connectTelegram(botToken: string): Promise<void> {
   // Handle non-text messages with placeholders so the agent knows something was sent
   bot.on("message:photo", (ctx) => storeNonTextMessage(ctx, "[Photo]"));
   bot.on("message:video", (ctx) => storeNonTextMessage(ctx, "[Video]"));
-  bot.on("message:voice", (ctx) => storeNonTextMessage(ctx, "[Voice message]"));
+  bot.on("message:voice", async (ctx) => {
+    const chatId = `tg:${ctx.chat.id}`;
+    const registeredGroups = getAllRegisteredGroups();
+    if (!registeredGroups[chatId]) return;
+
+    const timestamp = new Date(ctx.message.date * 1000).toISOString();
+    const senderName =
+      ctx.from?.first_name || ctx.from?.username || ctx.from?.id?.toString() || "Unknown";
+    const sender = ctx.from?.id?.toString() || "";
+    const msgId = ctx.message.message_id.toString();
+
+    // Fallback to placeholder if Whisper is not available
+    if (!isWhisperReady()) {
+      storeChatMetadata(chatId, timestamp);
+      storeMessageDirect({
+        id: msgId,
+        chat_jid: chatId,
+        sender,
+        sender_name: senderName,
+        content: "[Voice message]",
+        timestamp,
+        is_from_me: false,
+      });
+      return;
+    }
+
+    // Show typing indicator while transcribing
+    try {
+      await bot!.api.sendChatAction(chatId.replace(/^tg:/, ""), "typing");
+    } catch { /* ignore typing errors */ }
+
+    const voiceDir = path.join(os.tmpdir(), "nanoclaw-voice");
+    const tempFile = path.join(voiceDir, `${msgId}.ogg`);
+
+    try {
+      // Download voice file
+      const file = await ctx.getFile();
+      const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+      const response = await fetch(fileUrl);
+      if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+
+      fs.mkdirSync(voiceDir, { recursive: true });
+      const buffer = Buffer.from(await response.arrayBuffer());
+      fs.writeFileSync(tempFile, buffer);
+
+      // Transcribe
+      const text = await transcribe(tempFile);
+
+      if (!text) {
+        // Empty transcription — store as placeholder
+        storeChatMetadata(chatId, timestamp);
+        storeMessageDirect({
+          id: msgId,
+          chat_jid: chatId,
+          sender,
+          sender_name: senderName,
+          content: "[Voice message (empty)]",
+          timestamp,
+          is_from_me: false,
+        });
+        return;
+      }
+
+      // Check if it matches the voice trigger pattern
+      const triggerMatch = text.match(VOICE_TRIGGER_PATTERN);
+      if (triggerMatch) {
+        // Strip the "Hey Andy" prefix and store as @Andy <remainder>
+        const remainder = text.slice(triggerMatch[0].length).trim();
+        const content = `@${ASSISTANT_NAME} ${remainder}`;
+
+        storeChatMetadata(chatId, timestamp);
+        storeMessageDirect({
+          id: msgId,
+          chat_jid: chatId,
+          sender,
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: false,
+        });
+
+        logger.info(
+          { chatId, sender: senderName },
+          "Voice message transcribed (trigger match)",
+        );
+      } else {
+        // No trigger — echo transcription to chat only (don't store,
+        // so it won't be picked up and sent to Claude)
+        await sendTelegramMessage(chatId, text);
+
+        logger.info(
+          { chatId, sender: senderName },
+          "Voice message transcribed (no trigger, echo only)",
+        );
+      }
+    } catch (err) {
+      logger.error({ chatId, err }, "Voice transcription failed");
+
+      // Fallback to placeholder on error
+      storeChatMetadata(chatId, timestamp);
+      storeMessageDirect({
+        id: msgId,
+        chat_jid: chatId,
+        sender,
+        sender_name: senderName,
+        content: "[Voice message]",
+        timestamp,
+        is_from_me: false,
+      });
+    } finally {
+      // Clean up temp file
+      try {
+        if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
+      } catch { /* ignore cleanup errors */ }
+    }
+  });
   bot.on("message:audio", (ctx) => storeNonTextMessage(ctx, "[Audio]"));
   bot.on("message:document", (ctx) => {
     const name = ctx.message.document?.file_name || "file";

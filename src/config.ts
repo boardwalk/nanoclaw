@@ -1,6 +1,6 @@
 import path from 'path';
 
-export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Andy';
+export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Camilla';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
@@ -49,6 +49,15 @@ function escapeRegex(str: string): string {
 
 export const TRIGGER_PATTERN = new RegExp(
   `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
+  'i',
+);
+
+// Voice transcription configuration
+export const WHISPER_ENABLED = process.env.WHISPER_ENABLED !== '0';
+export const WHISPER_MODEL = process.env.WHISPER_MODEL || 'medium';
+
+export const VOICE_TRIGGER_PATTERN = new RegExp(
+  `^hey\\s+${escapeRegex(ASSISTANT_NAME)}\\b`,
   'i',
 );
 

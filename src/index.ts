@@ -15,6 +15,8 @@ import {
   TELEGRAM_BOT_TOKEN,
   TIMEZONE,
   TRIGGER_PATTERN,
+  WHISPER_ENABLED,
+  WHISPER_MODEL,
 } from './config.js';
 import {
   AvailableGroup,
@@ -54,6 +56,7 @@ import {
 } from './telegram.js';
 import { NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { startWhisper, stopWhisper } from './whisper.js';
 
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
@@ -848,6 +851,7 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    stopWhisper();
     stopTelegram();
     await queue.shutdown(10000);
     process.exit(0);
@@ -857,6 +861,18 @@ async function main(): Promise<void> {
 
   // Start Telegram bot
   await connectTelegram(TELEGRAM_BOT_TOKEN);
+
+  // Start Whisper transcription server
+  if (WHISPER_ENABLED) {
+    try {
+      execSync('python3 -c "import whisper"', { stdio: 'pipe' });
+      await startWhisper(WHISPER_MODEL);
+    } catch {
+      logger.warn(
+        'Whisper Python package not found. Voice transcription disabled. Install with: pip install openai-whisper',
+      );
+    }
+  }
 
   // Start all core services
   startSchedulerLoop({
