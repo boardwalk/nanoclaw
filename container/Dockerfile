@@ -1,5 +1,5 @@
 # NanoClaw Agent Container
-# Runs Claude Agent SDK in isolated Linux VM with browser automation
+# Runs Claude Agent SDK in isolated container with browser automation
 
 FROM node:22-slim
 
@@ -51,8 +51,8 @@ RUN npm run build
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
 # Create entrypoint script
-# Sources env from mounted /workspace/env-dir/env if it exists (workaround for Apple Container -i bug)
-# Stdin is buffered to /tmp then piped (Apple Container requires EOF to flush stdin pipe)
+# Sources env from mounted /workspace/env-dir/env if it exists
+# Stdin is buffered to /tmp then piped (requires EOF to flush stdin pipe)
 # Follow-up messages arrive via IPC files in /workspace/ipc/input/
 RUN printf '#!/bin/bash\nset -e\n[ -f /workspace/env-dir/env ] && export $(cat /workspace/env-dir/env | xargs)\ncd /app && npx tsc --outDir /tmp/dist 2>&1 >&2\nln -s /app/node_modules /tmp/dist/node_modules\nchmod -R a-w /tmp/dist\ncat > /tmp/input.json\nnode /tmp/dist/index.js < /tmp/input.json\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 

@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { exec, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -18,6 +19,8 @@ import {
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   STORE_DIR,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_ONLY,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -52,6 +55,12 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import {
+  connectTelegram,
+  sendTelegramMessage,
+  setTelegramTyping,
+  stopTelegram,
+} from './telegram.js';
 import { NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -90,6 +99,10 @@ function translateJid(jid: string): string {
 }
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
+  if (jid.startsWith('tg:')) {
+    if (isTyping) await setTelegramTyping(jid);
+    return;
+  }
   try {
     await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
   } catch (err) {
@@ -184,7 +197,7 @@ function getAvailableGroups(): AvailableGroup[] {
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
-    .filter((c) => c.jid !== '__group_sync__' && c.jid.endsWith('@g.us'))
+    .filter((c) => c.jid !== '__group_sync__' && (c.jid.endsWith('@g.us') || c.jid.startsWith('tg:')))
     .map((c) => ({
       jid: c.jid,
       name: c.name,
@@ -276,7 +289,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await sendMessage(chatJid, `${ASSISTANT_NAME}: ${text}`);
+        // Only prefix assistant name for non-main channels (group chats)
+        const message = isMainGroup ? text : `${ASSISTANT_NAME}: ${text}`;
+        await sendMessage(chatJid, message);
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -381,6 +396,13 @@ async function runAgent(
 }
 
 async function sendMessage(jid: string, text: string): Promise<void> {
+  // Route Telegram messages directly (no outgoing queue needed)
+  if (jid.startsWith('tg:')) {
+    await sendTelegramMessage(jid, text);
+    return;
+  }
+
+  // WhatsApp path (with outgoing queue for reconnection)
   if (!waConnected) {
     outgoingQueue.push({ jid, text });
     logger.info({ jid, length: text.length, queueSize: outgoingQueue.length }, 'WA disconnected, message queued');
@@ -460,10 +482,9 @@ function startIpcWatcher(): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await sendMessage(
-                    data.chatJid,
-                    `${ASSISTANT_NAME}: ${data.text}`,
-                  );
+                  // Only prefix assistant name for non-main channels (group chats)
+                  const message = isMain ? data.text : `${ASSISTANT_NAME}: ${data.text}`;
+                  await sendMessage(data.chatJid, message);
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
@@ -950,6 +971,8 @@ async function startMessageLoop(): Promise<void> {
           const formatted = formatMessages(messagesToSend);
 
           if (queue.sendMessage(chatJid, formatted)) {
+            // Show typing indicator for piped messages too
+            await setTyping(chatJid, true);
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -990,56 +1013,47 @@ function recoverPendingMessages(): void {
 
 function ensureContainerSystemRunning(): void {
   try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
-  } catch {
-    logger.info('Starting Apple Container system...');
-    try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
-      logger.info('Apple Container system started');
-    } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error(
-        '\n╔════════════════════════════════════════════════════════════════╗',
-      );
-      console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
-      );
-      console.error(
-        '║                                                                ║',
-      );
-      console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
-      );
-      console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
-      );
-      console.error(
-        '║  2. Run: container system start                               ║',
-      );
-      console.error(
-        '║  3. Restart NanoClaw                                          ║',
-      );
-      console.error(
-        '╚════════════════════════════════════════════════════════════════╝\n',
-      );
-      throw new Error('Apple Container system is required but failed to start');
-    }
+    execSync('podman version', { stdio: 'pipe' });
+    logger.debug('Podman is available');
+  } catch (err) {
+    logger.error({ err }, 'Failed to run Podman');
+    console.error(
+      '\n╔════════════════════════════════════════════════════════════════╗',
+    );
+    console.error(
+      '║  FATAL: Podman is required but not available                   ║',
+    );
+    console.error(
+      '║                                                                ║',
+    );
+    console.error(
+      '║  Agents cannot run without Podman. To fix:                    ║',
+    );
+    console.error(
+      '║  1. Install Podman: sudo pacman -S podman                     ║',
+    );
+    console.error(
+      '║  2. Restart NanoClaw                                          ║',
+    );
+    console.error(
+      '╚════════════════════════════════════════════════════════════════╝\n',
+    );
+    throw new Error('Podman is required but not available');
   }
 
   // Kill and clean up orphaned NanoClaw containers from previous runs
   try {
-    const output = execSync('container ls --format json', {
+    const output = execSync('podman ps --format json', {
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
     });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
+    const containers: { Names: string[] }[] = JSON.parse(output || '[]');
     const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
-      .map((c) => c.configuration.id);
+      .filter((c) => c.Names && c.Names.some((n) => n.startsWith('nanoclaw-')))
+      .flatMap((c) => c.Names.filter((n) => n.startsWith('nanoclaw-')));
     for (const name of orphans) {
       try {
-        execSync(`container stop ${name}`, { stdio: 'pipe' });
+        execSync(`podman stop ${name}`, { stdio: 'pipe' });
       } catch { /* already stopped */ }
     }
     if (orphans.length > 0) {
@@ -1059,13 +1073,40 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    stopTelegram();
     await queue.shutdown(10000);
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  await connectWhatsApp();
+  // Start Telegram bot if configured (independent of WhatsApp)
+  const hasTelegram = !!TELEGRAM_BOT_TOKEN;
+  if (hasTelegram) {
+    await connectTelegram(TELEGRAM_BOT_TOKEN);
+  }
+
+  if (!TELEGRAM_ONLY) {
+    await connectWhatsApp();
+  } else {
+    // Telegram-only mode: start all services that WhatsApp's connection.open normally starts
+    startSchedulerLoop({
+      registeredGroups: () => registeredGroups,
+      getSessions: () => sessions,
+      queue,
+      onProcess: (groupJid, proc, containerName, groupFolder) =>
+        queue.registerProcess(groupJid, proc, containerName, groupFolder),
+      sendMessage,
+      assistantName: ASSISTANT_NAME,
+    });
+    startIpcWatcher();
+    queue.setProcessMessagesFn(processGroupMessages);
+    recoverPendingMessages();
+    startMessageLoop();
+    logger.info(
+      `NanoClaw running (Telegram-only, trigger: @${ASSISTANT_NAME})`,
+    );
+  }
 }
 
 main().catch((err) => {
