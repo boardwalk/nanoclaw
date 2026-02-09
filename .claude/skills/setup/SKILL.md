@@ -1,6 +1,6 @@
 ---
 name: setup
-description: Run initial NanoClaw setup. Use when user wants to install dependencies, authenticate WhatsApp, register their main channel, or start the background services. Triggers on "setup", "install", "configure nanoclaw", or first-time setup requests.
+description: Run initial NanoClaw setup. Use when user wants to install dependencies, configure Telegram bot, register their main channel, or start the background services. Triggers on "setup", "install", "configure nanoclaw", or first-time setup requests.
 ---
 
 # NanoClaw Setup
@@ -137,27 +137,29 @@ else
 fi
 ```
 
-## 5. WhatsApp Authentication
-
-**USER ACTION REQUIRED**
-
-**IMPORTANT:** Run this command in the **foreground**. The QR code is multi-line ASCII art that must be displayed in full. Do NOT run in background or truncate the output.
+## 5. Configure Telegram Bot
 
 Tell the user:
-> A QR code will appear below. On your phone:
-> 1. Open WhatsApp
-> 2. Tap **Settings → Linked Devices → Link a Device**
-> 3. Scan the QR code
+> You need to create a Telegram bot to use as your assistant.
+>
+> 1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+> 2. Send `/newbot` to create a new bot
+> 3. Choose a name for your bot (e.g., "My Assistant")
+> 4. Choose a username (must end in "bot", e.g., "myassistant_bot")
+> 5. BotFather will give you an API token
+>
+> Paste the bot token here and I'll add it to `.env` for you.
 
-Run with a long Bash tool timeout (120000ms) so the user has time to scan. Do NOT use the `timeout` shell command (it's not available on macOS).
+Wait for the user to provide the token, then add it to `.env`:
 
 ```bash
-npm run auth
+echo "TELEGRAM_BOT_TOKEN=<token>" >> .env
 ```
 
-Wait for the script to output "Successfully authenticated" then continue.
-
-If it says "Already authenticated", skip to the next step.
+Verify:
+```bash
+grep "^TELEGRAM_BOT_TOKEN=" .env && echo "Bot token configured" || echo "Missing bot token"
+```
 
 ## 6. Configure Assistant Name and Main Channel
 
@@ -168,8 +170,8 @@ This step configures three things at once: the trigger word, the main channel ty
 Ask the user:
 > What trigger word do you want to use? (default: `Andy`)
 >
-> In group chats, messages starting with `@TriggerWord` will be sent to Claude.
-> In your main channel (and optionally solo chats), no prefix is needed — all messages are processed.
+> In Telegram group chats, messages starting with `@TriggerWord` will be sent to Claude.
+> In your main channel (and optionally private chats), no prefix is needed — all messages are processed.
 
 Store their choice for use in the steps below.
 
@@ -185,18 +187,17 @@ Store their choice for use in the steps below.
 > - Can write to global memory that all groups can read
 > - Has read-write access to the entire NanoClaw project
 >
-> **Recommendation:** Use your personal "Message Yourself" chat or a solo WhatsApp group as your main channel. This ensures only you have admin control.
+> **Recommendation:** Use your private chat with the bot (DM) as your main channel. This ensures only you have admin control.
 >
 > **Question:** Which setup will you use for your main channel?
 >
 > Options:
-> 1. Personal chat (Message Yourself) - Recommended
-> 2. Solo WhatsApp group (just me)
-> 3. Group with other people (I understand the security implications)
+> 1. Private chat with bot (DM) - Recommended
+> 2. Telegram group (I understand the security implications)
 
-If they choose option 3, ask a follow-up:
+If they choose option 2, ask a follow-up:
 
-> You've chosen a group with other people. This means everyone in that group will have admin privileges over NanoClaw.
+> You've chosen a Telegram group. This means everyone in that group will have admin privileges over NanoClaw.
 >
 > Are you sure you want to proceed? The other members will be able to:
 > - Read messages from your other registered chats
@@ -207,62 +208,57 @@ If they choose option 3, ask a follow-up:
 > 1. Yes, I understand and want to proceed
 > 2. No, let me use a personal chat or solo group instead
 
-### 6c. Register the main channel
+### 6c. Get Chat ID
 
-First build, then start the app briefly to connect to WhatsApp and sync group metadata. Use the Bash tool's timeout parameter (15000ms) — do NOT use the `timeout` shell command (it's not available on macOS). The app will be killed when the timeout fires, which is expected.
+Tell the user:
+> To get your chat ID, send the `/chatid` command to your bot in the chat you want to use as your main channel.
+>
+> For a **private chat**: Open Telegram, search for your bot, and send `/chatid`
+> For a **group**: Add your bot to the group, then send `/chatid` in the group
+>
+> The bot will reply with the chat ID. Paste it here.
 
-```bash
-npm run build
-```
+Wait for the user to provide the chat ID. It will be a number (e.g., `123456789` for users, or negative like `-1001234567890` for groups).
 
-Then run briefly (set Bash tool timeout to 15000ms):
-```bash
-npm run dev
-```
-
-**For personal chat** (they chose option 1):
-
-Personal chats are NOT synced to the database on startup — only groups are. Instead, ask the user for their phone number (with country code, no + or spaces, e.g. `14155551234`), then construct the JID as `{number}@s.whatsapp.net`.
-
-**For group** (they chose option 2 or 3):
-
-Groups are synced on startup via `groupFetchAllParticipating`. Query the database for recent groups:
-```bash
-sqlite3 store/messages.db "SELECT jid, name FROM chats WHERE jid LIKE '%@g.us' AND jid != '__group_sync__' ORDER BY last_message_time DESC LIMIT 40"
-```
-
-Show only the **10 most recent** group names to the user and ask them to pick one. If they say their group isn't in the list, show the next batch from the results you already have. If they tell you the group name directly, look it up:
-```bash
-sqlite3 store/messages.db "SELECT jid, name FROM chats WHERE name LIKE '%GROUP_NAME%' AND jid LIKE '%@g.us'"
-```
+The JID format is `tg:{chatId}` (e.g., `tg:123456789` or `tg:-1001234567890`).
 
 ### 6d. Write the configuration
 
-Once you have the JID, configure it. Use the assistant name from step 6a.
+Once you have the chat ID, configure it. Use the assistant name from step 6a and construct the JID as `tg:{chatId}`.
 
-For personal chats (solo, no prefix needed), set `requiresTrigger` to `false`:
-
-```json
-{
-  "JID_HERE": {
-    "name": "main",
-    "folder": "main",
-    "trigger": "@ASSISTANT_NAME",
-    "added_at": "CURRENT_ISO_TIMESTAMP",
-    "requiresTrigger": false
-  }
-}
-```
-
-For groups, keep `requiresTrigger` as `true` (default).
-
-Write to the database directly by creating a temporary registration script, or write `data/registered_groups.json` which will be auto-migrated on first run:
+For private chats (option 1 - no prefix needed), set `requiresTrigger` to `false`:
 
 ```bash
 mkdir -p data
+cat > data/registered_groups.json << EOF
+{
+  "tg:CHAT_ID_HERE": {
+    "name": "main",
+    "folder": "main",
+    "trigger": "@ASSISTANT_NAME",
+    "added_at": "$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")",
+    "requiresTrigger": false
+  }
+}
+EOF
 ```
 
-Then write `data/registered_groups.json` with the correct JID, trigger, and timestamp.
+For groups (option 2), set `requiresTrigger` to `true`:
+
+```bash
+mkdir -p data
+cat > data/registered_groups.json << EOF
+{
+  "tg:CHAT_ID_HERE": {
+    "name": "main",
+    "folder": "main",
+    "trigger": "@ASSISTANT_NAME",
+    "added_at": "$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")",
+    "requiresTrigger": true
+  }
+}
+EOF
+```
 
 If the user chose a name other than `Andy`, also update:
 1. `groups/global/CLAUDE.md` - Change "# Andy" and "You are Andy" to the new name
@@ -320,7 +316,7 @@ For each directory they provide, ask:
 ### 7b. Configure Non-Main Group Access
 
 Ask the user:
-> Should **non-main groups** (other WhatsApp chats you add later) be restricted to **read-only** access even if read-write is allowed for the directory?
+> Should **non-main groups** (other Telegram chats you add later) be restricted to **read-only** access even if read-write is allowed for the directory?
 >
 > Recommended: **Yes** - this prevents other groups from modifying files even if you grant them access to a directory.
 
@@ -444,16 +440,17 @@ launchctl list | grep nanoclaw
 ## 9. Test
 
 Tell the user (using the assistant name they configured):
-> Send `@ASSISTANT_NAME hello` in your registered chat.
+> Send a message to your bot in your registered chat.
 >
-> **Tip:** In your main channel, you don't need the `@` prefix — just send `hello` and the agent will respond.
+> - If you configured a **private chat** with `requiresTrigger: false`, just send `hello`
+> - If you configured a **group** with `requiresTrigger: true`, send `@ASSISTANT_NAME hello`
 
 Check the logs:
 ```bash
 tail -f logs/nanoclaw.log
 ```
 
-The user should receive a response in WhatsApp.
+The user should receive a response in Telegram.
 
 ## Troubleshooting
 
@@ -467,14 +464,14 @@ The user should receive a response in WhatsApp.
 
 **No response to messages**:
 - Verify the trigger pattern matches (e.g., `@AssistantName` at start of message)
-- Main channel doesn't require a prefix — all messages are processed
-- Personal/solo chats with `requiresTrigger: false` also don't need a prefix
+- Main channel with `requiresTrigger: false` doesn't need a prefix — all messages are processed
 - Check that the chat JID is in the database: `sqlite3 store/messages.db "SELECT * FROM registered_groups"`
+- Verify bot token is set: `grep TELEGRAM_BOT_TOKEN .env`
 - Check `logs/nanoclaw.log` for errors
 
-**WhatsApp disconnected**:
-- The service will show a macOS notification
-- Run `npm run auth` to re-authenticate
+**Telegram connection issues**:
+- Verify the bot token is correct
+- Check that the bot hasn't been deleted in @BotFather
 - Restart the service: `launchctl kickstart -k gui/$(id -u)/com.nanoclaw`
 
 **Unload service**:

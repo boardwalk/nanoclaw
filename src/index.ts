@@ -3,12 +3,6 @@ import { exec, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import makeWASocket, {
-  DisconnectReason,
-  WASocket,
-  makeCacheableSignalKeyStore,
-  useMultiFileAuthState,
-} from '@whiskeysockets/baileys';
 import { CronExpressionParser } from 'cron-parser';
 
 import {
@@ -18,9 +12,7 @@ import {
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
-  STORE_DIR,
   TELEGRAM_BOT_TOKEN,
-  TELEGRAM_ONLY,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -49,7 +41,6 @@ import {
   setRouterState,
   setSession,
   storeChatMetadata,
-  storeMessage,
   updateChatName,
   updateTask,
 } from './db.js';
@@ -64,49 +55,19 @@ import {
 import { NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
-const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-let sock: WASocket;
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
-// LID to phone number mapping (WhatsApp now sends LID JIDs for self-chats)
-let lidToPhoneMap: Record<string, string> = {};
-// Guards to prevent duplicate loops on WhatsApp reconnect
+// Guards to prevent duplicate loops
 let messageLoopRunning = false;
 let ipcWatcherRunning = false;
-let groupSyncTimerStarted = false;
-// WhatsApp connection state and outgoing message queue
-let waConnected = false;
-const outgoingQueue: Array<{ jid: string; text: string }> = [];
 
 const queue = new GroupQueue();
 
-/**
- * Translate a JID from LID format to phone format if we have a mapping.
- * Returns the original JID if no mapping exists.
- */
-function translateJid(jid: string): string {
-  if (!jid.endsWith('@lid')) return jid;
-  const lidUser = jid.split('@')[0].split(':')[0];
-  const phoneJid = lidToPhoneMap[lidUser];
-  if (phoneJid) {
-    logger.debug({ lidJid: jid, phoneJid }, 'Translated LID to phone JID');
-    return phoneJid;
-  }
-  return jid;
-}
-
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
-  if (jid.startsWith('tg:')) {
-    if (isTyping) await setTelegramTyping(jid);
-    return;
-  }
-  try {
-    await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
-  } catch (err) {
-    logger.debug({ jid, err }, 'Failed to update typing status');
+  if (isTyping) {
+    await setTelegramTyping(jid);
   }
 }
 
@@ -151,44 +112,6 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 }
 
 /**
- * Sync group metadata from WhatsApp.
- * Fetches all participating groups and stores their names in the database.
- * Called on startup, daily, and on-demand via IPC.
- */
-async function syncGroupMetadata(force = false): Promise<void> {
-  // Check if we need to sync (skip if synced recently, unless forced)
-  if (!force) {
-    const lastSync = getLastGroupSync();
-    if (lastSync) {
-      const lastSyncTime = new Date(lastSync).getTime();
-      const now = Date.now();
-      if (now - lastSyncTime < GROUP_SYNC_INTERVAL_MS) {
-        logger.debug({ lastSync }, 'Skipping group sync - synced recently');
-        return;
-      }
-    }
-  }
-
-  try {
-    logger.info('Syncing group metadata from WhatsApp...');
-    const groups = await sock.groupFetchAllParticipating();
-
-    let count = 0;
-    for (const [jid, metadata] of Object.entries(groups)) {
-      if (metadata.subject) {
-        updateChatName(jid, metadata.subject);
-        count++;
-      }
-    }
-
-    setLastGroupSync();
-    logger.info({ count }, 'Group metadata synced');
-  } catch (err) {
-    logger.error({ err }, 'Failed to sync group metadata');
-  }
-}
-
-/**
  * Get available groups list for the agent.
  * Returns groups ordered by most recent activity.
  */
@@ -197,7 +120,7 @@ function getAvailableGroups(): AvailableGroup[] {
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
-    .filter((c) => c.jid !== '__group_sync__' && (c.jid.endsWith('@g.us') || c.jid.startsWith('tg:')))
+    .filter((c) => c.jid !== '__group_sync__' && c.jid.startsWith('tg:'))
     .map((c) => ({
       jid: c.jid,
       name: c.name,
@@ -225,7 +148,7 @@ function formatMessages(messages: NewMessage[]): string {
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  *
- * Uses streaming output: agent results are sent to WhatsApp as they arrive.
+ * Uses streaming output: agent results are sent to the messaging channel as they arrive.
  * The container stays alive for IDLE_TIMEOUT after each result, allowing
  * rapid-fire messages to be piped in without spawning a new container.
  */
@@ -396,44 +319,7 @@ async function runAgent(
 }
 
 async function sendMessage(jid: string, text: string): Promise<void> {
-  // Route Telegram messages directly (no outgoing queue needed)
-  if (jid.startsWith('tg:')) {
-    await sendTelegramMessage(jid, text);
-    return;
-  }
-
-  // WhatsApp path (with outgoing queue for reconnection)
-  if (!waConnected) {
-    outgoingQueue.push({ jid, text });
-    logger.info({ jid, length: text.length, queueSize: outgoingQueue.length }, 'WA disconnected, message queued');
-    return;
-  }
-  try {
-    await sock.sendMessage(jid, { text });
-    logger.info({ jid, length: text.length }, 'Message sent');
-  } catch (err) {
-    // If send fails, queue it for retry on reconnect
-    outgoingQueue.push({ jid, text });
-    logger.warn({ jid, err, queueSize: outgoingQueue.length }, 'Failed to send, message queued');
-  }
-}
-
-let flushing = false;
-async function flushOutgoingQueue(): Promise<void> {
-  if (flushing || outgoingQueue.length === 0) return;
-  flushing = true;
-  try {
-    logger.info({ count: outgoingQueue.length }, 'Flushing outgoing message queue');
-    // Process one at a time — sendMessage re-queues on failure internally.
-    // Shift instead of splice so unattempted messages stay in the queue
-    // if an unexpected error occurs.
-    while (outgoingQueue.length > 0) {
-      const item = outgoingQueue.shift()!;
-      await sendMessage(item.jid, item.text);
-    }
-  } finally {
-    flushing = false;
-  }
+  await sendTelegramMessage(jid, text);
 }
 
 function startIpcWatcher(): void {
@@ -732,7 +618,6 @@ async function processTaskIpc(
           { sourceGroup },
           'Group metadata refresh requested via IPC',
         );
-        await syncGroupMetadata(true);
         // Write updated snapshot immediately
         const availableGroups = getAvailableGroups();
         writeGroupsSnapshot(
@@ -777,133 +662,6 @@ async function processTaskIpc(
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
-}
-
-async function connectWhatsApp(): Promise<void> {
-  const authDir = path.join(STORE_DIR, 'auth');
-  fs.mkdirSync(authDir, { recursive: true });
-
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-
-  sock = makeWASocket({
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    printQRInTerminal: false,
-    logger,
-    browser: ['NanoClaw', 'Chrome', '1.0.0'],
-  });
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      const msg =
-        'WhatsApp authentication required. Run /setup in Claude Code.';
-      logger.error(msg);
-      exec(
-        `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
-      );
-      setTimeout(() => process.exit(1), 1000);
-    }
-
-    if (connection === 'close') {
-      waConnected = false;
-      const reason = (lastDisconnect?.error as any)?.output?.statusCode;
-      const shouldReconnect = reason !== DisconnectReason.loggedOut;
-      logger.info({ reason, shouldReconnect, queuedMessages: outgoingQueue.length }, 'Connection closed');
-
-      if (shouldReconnect) {
-        logger.info('Reconnecting...');
-        connectWhatsApp().catch((err) => {
-          logger.error({ err }, 'Failed to reconnect, retrying in 5s');
-          setTimeout(() => {
-            connectWhatsApp().catch((err2) => {
-              logger.error({ err: err2 }, 'Reconnection retry failed');
-            });
-          }, 5000);
-        });
-      } else {
-        logger.info('Logged out. Run /setup to re-authenticate.');
-        process.exit(0);
-      }
-    } else if (connection === 'open') {
-      waConnected = true;
-      logger.info('Connected to WhatsApp');
-
-      // Build LID to phone mapping from auth state for self-chat translation
-      if (sock.user) {
-        const phoneUser = sock.user.id.split(':')[0];
-        const lidUser = sock.user.lid?.split(':')[0];
-        if (lidUser && phoneUser) {
-          lidToPhoneMap[lidUser] = `${phoneUser}@s.whatsapp.net`;
-          logger.debug({ lidUser, phoneUser }, 'LID to phone mapping set');
-        }
-      }
-
-      // Flush any messages queued while disconnected
-      flushOutgoingQueue().catch((err) =>
-        logger.error({ err }, 'Failed to flush outgoing queue'),
-      );
-
-      // Sync group metadata on startup (respects 24h cache)
-      syncGroupMetadata().catch((err) =>
-        logger.error({ err }, 'Initial group sync failed'),
-      );
-      // Set up daily sync timer (only once)
-      if (!groupSyncTimerStarted) {
-        groupSyncTimerStarted = true;
-        setInterval(() => {
-          syncGroupMetadata().catch((err) =>
-            logger.error({ err }, 'Periodic group sync failed'),
-          );
-        }, GROUP_SYNC_INTERVAL_MS);
-      }
-      startSchedulerLoop({
-        registeredGroups: () => registeredGroups,
-        getSessions: () => sessions,
-        queue,
-        onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
-        sendMessage,
-        assistantName: ASSISTANT_NAME,
-      });
-      startIpcWatcher();
-      queue.setProcessMessagesFn(processGroupMessages);
-      recoverPendingMessages();
-      startMessageLoop();
-    }
-  });
-
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('messages.upsert', ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.message) continue;
-      const rawJid = msg.key.remoteJid;
-      if (!rawJid || rawJid === 'status@broadcast') continue;
-
-      // Translate LID JID to phone JID if applicable
-      const chatJid = translateJid(rawJid);
-
-      const timestamp = new Date(
-        Number(msg.messageTimestamp) * 1000,
-      ).toISOString();
-
-      // Always store chat metadata for group discovery
-      storeChatMetadata(chatJid, timestamp);
-
-      // Only store full message content for registered groups
-      if (registeredGroups[chatJid]) {
-        storeMessage(
-          msg,
-          chatJid,
-          msg.key.fromMe || false,
-          msg.pushName || undefined,
-        );
-      }
-    }
-  });
 }
 
 async function startMessageLoop(): Promise<void> {
@@ -1070,6 +828,23 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
+  // Check for legacy WhatsApp chats
+  const allChats = getAllChats();
+  const hasWhatsAppChats = allChats.some(
+    (c) => c.jid.includes('@g.us') || c.jid.includes('@s.whatsapp.net'),
+  );
+  if (hasWhatsAppChats) {
+    logger.warn(
+      'Found WhatsApp chats in database. These will no longer receive messages. Please register Telegram chats instead.',
+    );
+  }
+
+  // Validate Telegram configuration
+  if (!TELEGRAM_BOT_TOKEN) {
+    logger.error('TELEGRAM_BOT_TOKEN is required. Please add it to .env');
+    process.exit(1);
+  }
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
@@ -1080,33 +855,24 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Start Telegram bot if configured (independent of WhatsApp)
-  const hasTelegram = !!TELEGRAM_BOT_TOKEN;
-  if (hasTelegram) {
-    await connectTelegram(TELEGRAM_BOT_TOKEN);
-  }
+  // Start Telegram bot
+  await connectTelegram(TELEGRAM_BOT_TOKEN);
 
-  if (!TELEGRAM_ONLY) {
-    await connectWhatsApp();
-  } else {
-    // Telegram-only mode: start all services that WhatsApp's connection.open normally starts
-    startSchedulerLoop({
-      registeredGroups: () => registeredGroups,
-      getSessions: () => sessions,
-      queue,
-      onProcess: (groupJid, proc, containerName, groupFolder) =>
-        queue.registerProcess(groupJid, proc, containerName, groupFolder),
-      sendMessage,
-      assistantName: ASSISTANT_NAME,
-    });
-    startIpcWatcher();
-    queue.setProcessMessagesFn(processGroupMessages);
-    recoverPendingMessages();
-    startMessageLoop();
-    logger.info(
-      `NanoClaw running (Telegram-only, trigger: @${ASSISTANT_NAME})`,
-    );
-  }
+  // Start all core services
+  startSchedulerLoop({
+    registeredGroups: () => registeredGroups,
+    getSessions: () => sessions,
+    queue,
+    onProcess: (groupJid, proc, containerName, groupFolder) =>
+      queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    sendMessage,
+    assistantName: ASSISTANT_NAME,
+  });
+  startIpcWatcher();
+  queue.setProcessMessagesFn(processGroupMessages);
+  recoverPendingMessages();
+  startMessageLoop();
+  logger.info(`NanoClaw running (Telegram, trigger: @${ASSISTANT_NAME})`);
 }
 
 main().catch((err) => {

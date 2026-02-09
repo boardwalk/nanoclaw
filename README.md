@@ -40,15 +40,15 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 
 **AI-native.** No installation wizard; Claude Code guides setup. No monitoring dashboard; ask Claude what's happening. No debugging tools; describe the problem, Claude fixes it.
 
-**Skills over features.** Contributors shouldn't add features (e.g. support for Telegram) to the codebase. Instead, they contribute [claude code skills](https://code.claude.com/docs/en/skills) like `/add-telegram` that transform your fork. You end up with clean code that does exactly what you need.
+**Skills over features.** Contributors shouldn't add features (e.g. support for WhatsApp or Slack) to the codebase. Instead, they contribute [claude code skills](https://code.claude.com/docs/en/skills) like `/add-whatsapp` that transform your fork. You end up with clean code that does exactly what you need.
 
 **Best harness, best model.** This runs on Claude Agent SDK, which means you're running Claude Code directly. The harness matters. A bad harness makes even smart models seem dumb, a good harness gives them superpowers. Claude Code is (IMO) the best harness available.
 
 ## What It Supports
 
-- **WhatsApp I/O** - Message Claude from your phone
+- **Telegram I/O** - Message Claude from your phone
 - **Isolated group context** - Each group has its own `CLAUDE.md` memory, isolated filesystem, and runs in its own container sandbox with only that filesystem mounted
-- **Main channel** - Your private channel (self-chat) for admin control; every other group is completely isolated
+- **Main channel** - Your private chat for admin control; every other group is completely isolated
 - **Scheduled tasks** - Recurring jobs that run Claude and can message you back
 - **Web access** - Search and fetch content
 - **Container isolation** - Agents sandboxed in Apple Container (macOS) or Docker (macOS/Linux)
@@ -98,9 +98,9 @@ Users then run `/add-telegram` on their fork and get clean code that does exactl
 Skills we'd love to see:
 
 **Communication Channels**
-- `/add-telegram` - Add Telegram as channel. Should give the user option to replace WhatsApp or add as additional channel. Also should be possible to add it as a control channel (where it can trigger actions) or just a channel that can be used in actions triggered elsewhere
 - `/add-slack` - Add Slack
 - `/add-discord` - Add Discord
+- `/add-whatsapp` - Add WhatsApp support alongside Telegram
 
 **Platform Support**
 - `/setup-windows` - Windows via WSL2 + Docker
@@ -118,13 +118,13 @@ Skills we'd love to see:
 ## Architecture
 
 ```
-WhatsApp (baileys) --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
+Telegram (grammy) --> SQLite --> Polling loop --> Container (Claude Agent SDK) --> Response
 ```
 
 Single Node.js process. Agents execute in isolated Linux containers with mounted directories. Per-group message queue with concurrency control. IPC via filesystem.
 
 Key files:
-- `src/index.ts` - Main app: WhatsApp connection, message loop, IPC
+- `src/index.ts` - Main app: Telegram connection, message loop, IPC
 - `src/group-queue.ts` - Per-group queue with global concurrency limit
 - `src/container-runner.ts` - Spawns streaming agent containers
 - `src/task-scheduler.ts` - Runs scheduled tasks
@@ -133,9 +133,9 @@ Key files:
 
 ## FAQ
 
-**Why WhatsApp and not Telegram/Signal/etc?**
+**Why Telegram and not WhatsApp/Signal/etc?**
 
-Because I use WhatsApp. Fork it and run a skill to change it. That's the whole point.
+Because I use Telegram. Fork it and run a skill to change it (like `/add-whatsapp` or `/add-slack`). That's the whole point.
 
 **Why Apple Container instead of Docker?**
 
