@@ -391,8 +391,13 @@ function startIpcWatcher(): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  const imagePath = path.join(messagesDir, data.imageFilename);
-                  if (fs.existsSync(imagePath)) {
+                  const imagePath = path.resolve(messagesDir, data.imageFilename);
+                  if (!imagePath.startsWith(messagesDir + path.sep)) {
+                    logger.warn(
+                      { chatJid: data.chatJid, imageFilename: data.imageFilename, sourceGroup },
+                      'IPC photo path traversal blocked',
+                    );
+                  } else if (fs.existsSync(imagePath)) {
                     const caption = data.caption
                       ? (isMain ? data.caption : `${ASSISTANT_NAME}: ${data.caption}`)
                       : (!isMain ? ASSISTANT_NAME : undefined);
