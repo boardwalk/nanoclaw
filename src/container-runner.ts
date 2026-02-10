@@ -361,11 +361,16 @@ export async function runContainerAgent(
     });
 
     let timedOut = false;
+    let hadStreamedOutput = false;
     const timeoutMs = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
 
     const killOnTimeout = () => {
       timedOut = true;
-      logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
+      if (hadStreamedOutput) {
+        logger.info({ group: group.name, containerName }, 'Container idle timeout, stopping gracefully');
+      } else {
+        logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
+      }
       exec(`podman stop ${containerName}`, { timeout: 15000 }, (err) => {
         if (err) {
           logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
@@ -376,10 +381,15 @@ export async function runContainerAgent(
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);
 
-    // Reset the timeout whenever there's activity (streaming output)
+    // Reset the timeout whenever there's activity (streaming output).
+    // Add a 30s grace period so the caller's idle timeout (which writes a
+    // _close sentinel) fires first and the container can exit cleanly
+    // before the hard kill.
+    const GRACE_PERIOD_MS = 30_000;
     const resetTimeout = () => {
+      hadStreamedOutput = true;
       clearTimeout(timeout);
-      timeout = setTimeout(killOnTimeout, timeoutMs);
+      timeout = setTimeout(killOnTimeout, timeoutMs + GRACE_PERIOD_MS);
     };
 
     container.on('close', (code) => {
@@ -389,6 +399,35 @@ export async function runContainerAgent(
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const timeoutLog = path.join(logsDir, `container-${ts}.log`);
+
+        // If we already streamed successful output, the timeout is just
+        // idle cleanup — not a failure.  Resolve as success so the caller
+        // doesn't roll back the message cursor and reprocess messages.
+        if (hadStreamedOutput && onOutput) {
+          fs.writeFileSync(timeoutLog, [
+            `=== Container Run Log (IDLE TIMEOUT) ===`,
+            `Timestamp: ${new Date().toISOString()}`,
+            `Group: ${group.name}`,
+            `Container: ${containerName}`,
+            `Duration: ${duration}ms`,
+            `Exit Code: ${code}`,
+          ].join('\n'));
+
+          logger.info(
+            { group: group.name, containerName, duration, code },
+            'Container idle timeout after successful output',
+          );
+
+          outputChain.then(() => {
+            resolve({
+              status: 'success',
+              result: null,
+              newSessionId,
+            });
+          });
+          return;
+        }
+
         fs.writeFileSync(timeoutLog, [
           `=== Container Run Log (TIMEOUT) ===`,
           `Timestamp: ${new Date().toISOString()}`,
