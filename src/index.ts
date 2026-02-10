@@ -51,6 +51,7 @@ import { startSchedulerLoop } from './task-scheduler.js';
 import {
   connectTelegram,
   sendTelegramMessage,
+  sendTelegramPhoto,
   setTelegramTyping,
   stopTelegram,
 } from './telegram.js';
@@ -382,6 +383,35 @@ function startIpcWatcher(): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (data.type === 'photo' && data.chatJid && data.imageFilename) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  const imagePath = path.join(messagesDir, data.imageFilename);
+                  if (fs.existsSync(imagePath)) {
+                    const caption = data.caption
+                      ? (isMain ? data.caption : `${ASSISTANT_NAME}: ${data.caption}`)
+                      : (!isMain ? ASSISTANT_NAME : undefined);
+                    await sendTelegramPhoto(data.chatJid, imagePath, caption);
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, imageFilename: data.imageFilename },
+                      'IPC photo sent',
+                    );
+                    try { fs.unlinkSync(imagePath); } catch { /* ignore cleanup errors */ }
+                  } else {
+                    logger.error(
+                      { chatJid: data.chatJid, imageFilename: data.imageFilename, sourceGroup },
+                      'IPC photo file not found',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC photo attempt blocked',
                   );
                 }
               }

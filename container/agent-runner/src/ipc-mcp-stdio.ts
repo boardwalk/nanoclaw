@@ -59,6 +59,62 @@ server.tool(
 );
 
 server.tool(
+  'send_photo',
+  "Send a photo or image to the user or group. Use this to share screenshots, generated images, or any image file. The file must exist at the given path inside the container.",
+  {
+    file_path: z.string().describe('Absolute path to the image file (e.g., /workspace/group/screenshot.png)'),
+    caption: z.string().optional().describe('Optional caption text to accompany the photo'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    const stat = fs.statSync(args.file_path);
+    if (!stat.isFile()) {
+      return {
+        content: [{ type: 'text' as const, text: `Not a file: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    // Telegram photo limit is 10MB
+    const MAX_PHOTO_SIZE = 10 * 1024 * 1024;
+    if (stat.size > MAX_PHOTO_SIZE) {
+      return {
+        content: [{ type: 'text' as const, text: `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Telegram photo limit is 10MB.` }],
+        isError: true,
+      };
+    }
+
+    // Copy image to IPC messages directory with a unique name
+    const ext = path.extname(args.file_path) || '.png';
+    const uniqueId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const imageFilename = `${uniqueId}${ext}`;
+    const imageDest = path.join(MESSAGES_DIR, imageFilename);
+
+    fs.mkdirSync(MESSAGES_DIR, { recursive: true });
+    fs.copyFileSync(args.file_path, imageDest);
+
+    const data = {
+      type: 'photo',
+      chatJid,
+      imageFilename,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'Photo sent.' }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 

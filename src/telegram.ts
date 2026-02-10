@@ -2,7 +2,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 
-import { Bot } from "grammy";
+import { Bot, InputFile } from "grammy";
 import {
   ASSISTANT_NAME,
   TELEGRAM_BOT_TOKEN,
@@ -331,6 +331,36 @@ export async function setTelegramTyping(chatId: string): Promise<void> {
 
 export function isTelegramConnected(): boolean {
   return bot !== null;
+}
+
+export async function sendTelegramPhoto(
+  chatId: string,
+  imagePath: string,
+  caption?: string,
+): Promise<void> {
+  if (!bot) {
+    logger.warn("Telegram bot not initialized");
+    return;
+  }
+
+  try {
+    const numericId = chatId.replace(/^tg:/, "");
+
+    // Telegram caption limit is 1024 characters
+    const truncatedCaption =
+      caption && caption.length > 1024
+        ? caption.slice(0, 1021) + "..."
+        : caption;
+
+    await bot.api.sendPhoto(
+      numericId,
+      new InputFile(imagePath),
+      truncatedCaption ? { caption: truncatedCaption } : undefined,
+    );
+    logger.info({ chatId, imagePath, hasCaption: !!caption }, "Telegram photo sent");
+  } catch (err) {
+    logger.error({ chatId, imagePath, err }, "Failed to send Telegram photo");
+  }
 }
 
 export function stopTelegram(): void {
